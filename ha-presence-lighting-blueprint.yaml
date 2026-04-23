@@ -1,0 +1,142 @@
+blueprint:
+  name: Room Presence - Restore Previous Lighting State
+  description: >
+    Presence-based room lighting with two categories of entities:
+    1) ceiling lights/switches
+    2) lamps/accent lights/switches
+
+    Behavior:
+    - When presence is detected and no saved state exists, turn on the ceiling entities.
+    - When presence is lost, wait for the vacancy delay, then snapshot whatever entities are still ON
+      and mark that a saved state exists.
+    - When presence is detected again, restore that saved state instead of defaulting to ceiling lights.
+    - If nothing is left on when the room becomes vacant, the saved-state flag is cleared.
+
+    Notes:
+    - Create one input_boolean helper per room and assign it below.
+    - The room name is used to generate the dynamic scene id.
+
+  domain: automation
+  input:
+    presence_sensor:
+      name: Presence sensor
+      selector:
+        entity:
+          domain: binary_sensor
+
+    vacancy_delay:
+      name: Vacancy delay
+      description: How long presence must be off before the room state is stored.
+      default:
+        minutes: 0
+        seconds: 30
+      selector:
+        duration: {}
+
+    ceiling_entities:
+      name: Ceiling lights / switches
+      description: Entities to turn on by default when no previous room state exists.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: light
+            - domain: switch
+
+    accent_entities:
+      name: Lamps / accent lights / switches
+      description: Extra room entities that should be included in snapshot/restore.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: light
+            - domain: switch
+
+    restore_flag:
+      name: Restore-state helper
+      description: An input_boolean helper dedicated to this room.
+      selector:
+        entity:
+          domain: input_boolean
+
+    room_name:
+      name: Room name
+      description: Used to build the dynamic scene id, for example "Living Room".
+      selector:
+        text:
+
+mode: restart
+
+variables:
+  room_slug: "{{ room_name | lower | replace(' ', '_') | regex_replace('[^a-z0-9_]', '') }}"
+  scene_id_raw: "presence_restore_{{ room_slug }}"
+  scene_entity: "scene.{{ scene_id_raw }}"
+  ceiling_list: !input ceiling_entities
+  accent_list: !input accent_entities
+  all_entities: "{{ ceiling_list + accent_list }}"
+
+triggers:
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "on"
+    id: occupied
+
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "off"
+    id: vacant
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: occupied
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: state
+                    entity_id: !input restore_flag
+                    state: "on"
+                sequence:
+                  - action: scene.turn_on
+                    target:
+                      entity_id: "{{ scene_entity }}"
+            default:
+              - action: homeassistant.turn_on
+                target:
+                  entity_id: !input ceiling_entities
+
+      - conditions:
+          - condition: trigger
+            id: vacant
+        sequence:
+          - delay: !input vacancy_delay
+
+          - condition: state
+            entity_id: !input presence_sensor
+            state: "off"
+
+          - variables:
+              currently_on: >
+                {{ expand(all_entities)
+                   | selectattr('state', 'eq', 'on')
+                   | map(attribute='entity_id')
+                   | list }}
+
+          - choose:
+              - conditions: "{{ currently_on | count > 0 }}"
+                sequence:
+                  - action: scene.create
+                    data:
+                      scene_id: "{{ scene_id_raw }}"
+                      snapshot_entities: "{{ currently_on }}"
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: !input restore_flag
+            default:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: !input restore_flag
