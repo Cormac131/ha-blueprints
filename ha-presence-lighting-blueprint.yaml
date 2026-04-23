@@ -1,22 +1,30 @@
 blueprint:
-  name: Room Presence - Restore Previous Lighting State
+  name: Room Presence - Stateful Lighting with Restore, Lux, Override, Night Mode, and Auto Clear
   description: >
     Presence-based room lighting with two categories of entities:
     1) ceiling lights/switches
     2) lamps/accent lights/switches
 
-    Behavior:
-    - When presence is detected and no saved state exists, turn on the ceiling entities.
-    - When presence is lost, wait for the vacancy delay, then snapshot whatever entities are still ON
-      and mark that a saved state exists.
-    - When presence is detected again, restore that saved state instead of defaulting to ceiling lights.
-    - If nothing is left on when the room becomes vacant, the saved-state flag is cleared.
-
-    Notes:
-    - Create one input_boolean helper per room and assign it below.
-    - The room name is used to generate the dynamic scene id.
+    Features:
+    - On presence:
+      - if a saved room state exists, restore it
+      - otherwise apply default entry behavior
+    - Default entry behavior:
+      - daytime: turn on ceiling entities
+      - nighttime: optionally turn on accent entities instead
+    - Vacancy:
+      - wait for the configured non-detection delay
+      - optionally use a different delay at night
+      - snapshot whatever tracked entities are still ON
+      - mark restore flag ON
+      - turn tracked entities OFF
+    - If nothing is ON at vacancy time, clear the restore flag
+    - Optional lux threshold blocks default turn-on when the room is already bright
+    - Optional manual override helper blocks automation actions entirely
+    - Optional clear-restore-after-use resets the saved restore state after one successful restore
 
   domain: automation
+
   input:
     presence_sensor:
       name: Presence sensor
@@ -24,18 +32,9 @@ blueprint:
         entity:
           domain: binary_sensor
 
-    vacancy_delay:
-      name: Vacancy delay
-      description: How long presence must be off before the room state is stored.
-      default:
-        minutes: 0
-        seconds: 30
-      selector:
-        duration: {}
-
     ceiling_entities:
       name: Ceiling lights / switches
-      description: Entities to turn on by default when no previous room state exists.
+      description: Default daytime entry entities.
       default: []
       selector:
         entity:
@@ -46,7 +45,7 @@ blueprint:
 
     accent_entities:
       name: Lamps / accent lights / switches
-      description: Extra room entities that should be included in snapshot/restore.
+      description: Included in restore snapshots and optionally used for night entry.
       default: []
       selector:
         entity:
@@ -57,16 +56,138 @@ blueprint:
 
     restore_flag:
       name: Restore-state helper
-      description: An input_boolean helper dedicated to this room.
+      description: Dedicated input_boolean for this room.
       selector:
         entity:
           domain: input_boolean
 
     room_name:
       name: Room name
-      description: Used to build the dynamic scene id, for example "Living Room".
+      description: Used to build the dynamic scene id, for example Living Room.
       selector:
         text:
+
+    clear_restore_after_use:
+      name: Clear restore after successful restore
+      description: >
+        If enabled, the restore flag is turned off immediately after a saved state
+        is restored once. The next entry will use normal default behavior unless a
+        new state has been stored on vacancy.
+      default: false
+      selector:
+        boolean: {}
+
+    manual_override_helper:
+      name: Manual override helper
+      description: >
+        Optional input_boolean. When ON, this automation does nothing.
+        Useful for movie mode, guests, bedtime, etc.
+      default: {}
+      selector:
+        entity:
+          domain: input_boolean
+          multiple: false
+
+    lux_sensor:
+      name: Lux sensor
+      description: Optional illuminance sensor used to suppress default turn-on if the room is already bright.
+      default: {}
+      selector:
+        entity:
+          domain: sensor
+          multiple: false
+
+    lux_threshold:
+      name: Lux threshold
+      description: >
+        Default turn-on is allowed only when lux is below this value.
+        Ignored if no lux sensor is selected.
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 1000
+          step: 1
+          mode: box
+          unit_of_measurement: lx
+
+    vacancy_delay:
+      name: Day non-detection delay
+      description: How long presence must be off before storing state and turning entities off.
+      default:
+        minutes: 0
+        seconds: 30
+      selector:
+        duration: {}
+
+    use_night_delay:
+      name: Use separate night non-detection delay
+      default: false
+      selector:
+        boolean: {}
+
+    night_vacancy_delay:
+      name: Night non-detection delay
+      default:
+        minutes: 15
+        seconds: 0
+      selector:
+        duration: {}
+
+    use_night_mode:
+      name: Use night entry mode
+      description: During night hours, default first-entry behavior can use accent entities instead of ceiling entities.
+      default: false
+      selector:
+        boolean: {}
+
+    night_start:
+      name: Night start
+      default: "22:00:00"
+      selector:
+        time: {}
+
+    night_end:
+      name: Night end
+      default: "07:00:00"
+      selector:
+        time: {}
+
+    night_mode_target:
+      name: Night default target
+      description: Which category should be turned on for first entry at night.
+      default: accent
+      selector:
+        select:
+          options:
+            - label: Ceiling
+              value: ceiling
+            - label: Accent
+              value: accent
+
+    night_ceiling_brightness_pct:
+      name: Night ceiling brightness %
+      description: Used only for ceiling lights during night mode.
+      default: 25
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+          mode: slider
+          unit_of_measurement: "%"
+
+    night_accent_brightness_pct:
+      name: Night accent brightness %
+      description: Used only for accent lights during night mode.
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+          mode: slider
+          unit_of_measurement: "%"
 
 mode: restart
 
@@ -74,9 +195,50 @@ variables:
   room_slug: "{{ room_name | lower | replace(' ', '_') | regex_replace('[^a-z0-9_]', '') }}"
   scene_id_raw: "presence_restore_{{ room_slug }}"
   scene_entity: "scene.{{ scene_id_raw }}"
+
   ceiling_list: !input ceiling_entities
   accent_list: !input accent_entities
   all_entities: "{{ ceiling_list + accent_list }}"
+
+  ceiling_lights: "{{ ceiling_list | select('match', '^light\\.') | list }}"
+  ceiling_switches: "{{ ceiling_list | select('match', '^switch\\.') | list }}"
+  accent_lights: "{{ accent_list | select('match', '^light\\.') | list }}"
+  accent_switches: "{{ accent_list | select('match', '^switch\\.') | list }}"
+
+  override_entity: !input manual_override_helper
+  lux_entity: !input lux_sensor
+  lux_limit: !input lux_threshold
+
+  night_mode_enabled: !input use_night_mode
+  night_delay_enabled: !input use_night_delay
+  night_target: !input night_mode_target
+  night_start_input: !input night_start
+  night_end_input: !input night_end
+  clear_after_restore: !input clear_restore_after_use
+
+  is_night: >
+    {% set start = today_at(night_start_input) %}
+    {% set end = today_at(night_end_input) %}
+    {% if start <= end %}
+      {{ start <= now() < end }}
+    {% else %}
+      {{ now() >= start or now() < end }}
+    {% endif %}
+
+  override_active: >
+    {% if override_entity in [None, '', {}] %}
+      false
+    {% else %}
+      {{ is_state(override_entity, 'on') }}
+    {% endif %}
+
+  lux_allows_turn_on: >
+    {% if lux_entity in [None, '', {}] %}
+      true
+    {% else %}
+      {% set lux = states(lux_entity) %}
+      {{ lux not in ['unknown', 'unavailable', 'none', 'None', ''] and (lux | float(99999)) < (lux_limit | float(20)) }}
+    {% endif %}
 
 triggers:
   - trigger: state
@@ -92,6 +254,11 @@ triggers:
 actions:
   - choose:
       - conditions:
+          - condition: template
+            value_template: "{{ override_active }}"
+        sequence: []
+
+      - conditions:
           - condition: trigger
             id: occupied
         sequence:
@@ -104,20 +271,98 @@ actions:
                   - action: scene.turn_on
                     target:
                       entity_id: "{{ scene_entity }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ clear_after_restore }}"
+                    then:
+                      - action: input_boolean.turn_off
+                        target:
+                          entity_id: !input restore_flag
+
             default:
-              - action: homeassistant.turn_on
-                target:
-                  entity_id: !input ceiling_entities
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ not lux_allows_turn_on }}"
+                    sequence: []
+
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ night_mode_enabled and is_night and night_target == 'accent' }}"
+                    sequence:
+                      - if:
+                          - condition: template
+                            value_template: "{{ accent_lights | count > 0 }}"
+                        then:
+                          - action: light.turn_on
+                            target:
+                              entity_id: "{{ accent_lights }}"
+                            data:
+                              brightness_pct: !input night_accent_brightness_pct
+                      - if:
+                          - condition: template
+                            value_template: "{{ accent_switches | count > 0 }}"
+                        then:
+                          - action: switch.turn_on
+                            target:
+                              entity_id: "{{ accent_switches }}"
+
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ night_mode_enabled and is_night and night_target == 'ceiling' }}"
+                    sequence:
+                      - if:
+                          - condition: template
+                            value_template: "{{ ceiling_lights | count > 0 }}"
+                        then:
+                          - action: light.turn_on
+                            target:
+                              entity_id: "{{ ceiling_lights }}"
+                            data:
+                              brightness_pct: !input night_ceiling_brightness_pct
+                      - if:
+                          - condition: template
+                            value_template: "{{ ceiling_switches | count > 0 }}"
+                        then:
+                          - action: switch.turn_on
+                            target:
+                              entity_id: "{{ ceiling_switches }}"
+
+                default:
+                  - if:
+                      - condition: template
+                        value_template: "{{ ceiling_lights | count > 0 }}"
+                    then:
+                      - action: light.turn_on
+                        target:
+                          entity_id: "{{ ceiling_lights }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ ceiling_switches | count > 0 }}"
+                    then:
+                      - action: switch.turn_on
+                        target:
+                          entity_id: "{{ ceiling_switches }}"
 
       - conditions:
           - condition: trigger
             id: vacant
         sequence:
-          - delay: !input vacancy_delay
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ night_delay_enabled and is_night }}"
+                sequence:
+                  - delay: !input night_vacancy_delay
+            default:
+              - delay: !input vacancy_delay
 
           - condition: state
             entity_id: !input presence_sensor
             state: "off"
+
+          - condition: template
+            value_template: "{{ not override_active }}"
 
           - variables:
               currently_on: >
@@ -125,9 +370,15 @@ actions:
                    | selectattr('state', 'eq', 'on')
                    | map(attribute='entity_id')
                    | list }}
+              currently_on_lights: >
+                {{ currently_on | select('match', '^light\\.') | list }}
+              currently_on_switches: >
+                {{ currently_on | select('match', '^switch\\.') | list }}
 
           - choose:
-              - conditions: "{{ currently_on | count > 0 }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ currently_on | count > 0 }}"
                 sequence:
                   - action: scene.create
                     data:
@@ -136,7 +387,22 @@ actions:
                   - action: input_boolean.turn_on
                     target:
                       entity_id: !input restore_flag
+                  - if:
+                      - condition: template
+                        value_template: "{{ currently_on_lights | count > 0 }}"
+                    then:
+                      - action: light.turn_off
+                        target:
+                          entity_id: "{{ currently_on_lights }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ currently_on_switches | count > 0 }}"
+                    then:
+                      - action: switch.turn_off
+                        target:
+                          entity_id: "{{ currently_on_switches }}"
             default:
               - action: input_boolean.turn_off
                 target:
                   entity_id: !input restore_flag
+                  
